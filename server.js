@@ -15,7 +15,6 @@ const { randomUUID } = require("crypto");
 const cors     = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const twilio   = require("twilio");
-const { Client: PgClient } = require("pg");
 const { analyzeCustomerSpeech }                            = require("./decisionEngine");
 const { generateEmbedding, searchKnowledge, generateSuggestedReply } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
@@ -88,6 +87,28 @@ function escapeXml(value) {
     .replace(/'/g, "&apos;");
 }
 
+function safeRecordingUrl(recordingUrl) {
+  const raw = String(recordingUrl || "").trim();
+  if (!raw) return "";
+  return raw.endsWith(".mp3") || raw.endsWith(".wav") ? raw : `${raw}.mp3`;
+}
+
+async function hasActiveRecording(callId) {
+  const { data, error } = await supabase
+    .from("call_recordings")
+    .select("id,status,recording_sid")
+    .eq("call_id", callId)
+    .in("status", ["recording", "processing", "completed", "ready"])
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    console.warn("[recording] Active recording check failed:", error.message);
+    return false;
+  }
+  return Boolean(data?.length);
+}
+
 function buildPhoneVariants(rawPhone) {
   const digitsOnly = String(rawPhone || "").replace(/\D/g, "");
   if (!digitsOnly) return [rawPhone].filter(Boolean);
@@ -134,7 +155,6 @@ async function lookupCustomerByPhone(rawPhone) {
 function customerConferenceTwiml(callId) {
   const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
   const statusUrl        = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-  const recordingUrl     = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
   const room             = `room-${callId}`;
   console.log(`[twiml] Transcription callback: ${BASE_URL}/api/transcription?call_id=${callId}&role=customer`);
 
@@ -149,11 +169,8 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
-                statusCallback="${statusUrl}"
-                record="record-from-start"
-                recordingStatusCallback="${recordingUrl}"
-                recordingStatusCallbackMethod="POST">
+                statusCallbackEvent="start join leave end"
+                statusCallback="${statusUrl}">
       ${room}
     </Conference>
   </Dial>
@@ -326,7 +343,6 @@ app.post("/api/twilio/outbound", async (req, res) => {
   // Put agent into the conference room with transcription
   const agentTranscriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
   const statusUrl              = escapeXml(`${BASE_URL}/api/conference-status?call_id=${callId}`);
-  const recordingUrl           = escapeXml(`${BASE_URL}/api/recording-status?call_id=${callId}`);
 
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -338,11 +354,8 @@ app.post("/api/twilio/outbound", async (req, res) => {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
-                statusCallback="${statusUrl}"
-                record="record-from-start"
-                recordingStatusCallback="${recordingUrl}"
-                recordingStatusCallbackMethod="POST">
+                statusCallbackEvent="start join leave end"
+                statusCallback="${statusUrl}">
       ${room}
     </Conference>
   </Dial>
@@ -375,15 +388,129 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 });
 
 // -- Conference status callback (called when conference ends) -
-app.post("/api/conference-status", (req, res) => {
+app.post("/api/conference-status", async (req, res) => {
   const callId = String(req.query.call_id || "").trim();
   const event  = req.body.StatusCallbackEvent;
+  const conferenceSid = String(req.body.ConferenceSid || "").trim();
 
-  if (event === "conference-end" && callId) {
-    console.log(`Conference ended callId=${callId}`);
+  if (!callId) return res.status(200).end();
+
+  try {
+    if (event === "participant-join" && twilioClient && conferenceSid) {
+      // Start recording only when both parties are in conference (human-connected stage).
+      const participants = await twilioClient.conferences(conferenceSid).participants.list({
+        status: "connected",
+        limit: 20,
+      });
+      const activeCount = participants.length;
+
+      if (activeCount >= 2) {
+        const alreadyRecording = await hasActiveRecording(callId);
+        if (!alreadyRecording) {
+          const callbackUrl = `${BASE_URL}/api/twilio/recording-status?call_id=${callId}`;
+          const recording = await twilioClient.conferences(conferenceSid).recordings.create({
+            recordingStatusCallback: callbackUrl,
+            recordingStatusCallbackMethod: "POST",
+            recordingChannels: "dual",
+          });
+
+          const { error } = await supabase.from("call_recordings").insert({
+            call_id: callId,
+            recording_sid: recording.sid,
+            recording_url: "pending",
+            duration_seconds: null,
+            status: "recording",
+            channels: 2,
+          });
+          if (error) {
+            console.error("[recording] Insert on start failed:", error.message);
+          } else {
+            console.log(`[recording] Started callId=${callId} sid=${recording.sid}`);
+          }
+        }
+      }
+    }
+
+    if (event === "conference-end") {
+      const { error } = await supabase
+        .from("call_recordings")
+        .update({ status: "processing" })
+        .eq("call_id", callId)
+        .eq("status", "recording");
+      if (error) console.warn("[recording] Mark processing failed:", error.message);
+      console.log(`Conference ended callId=${callId}`);
+    }
+  } catch (err) {
+    console.error("[conference-status] Error:", err.message);
   }
 
   res.status(200).end();
+});
+
+// -- Recording status callback (Twilio -> DB finalize) --------
+app.post("/api/twilio/recording-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId = String(req.query.call_id || "").trim();
+  const recordingSid = String(req.body.RecordingSid || "").trim();
+  const recordingStatus = String(req.body.RecordingStatus || "").trim().toLowerCase();
+  const recordingUrl = safeRecordingUrl(req.body.RecordingUrl);
+  const durationSecondsRaw = Number(req.body.RecordingDuration);
+  const durationSeconds = Number.isFinite(durationSecondsRaw) ? durationSecondsRaw : null;
+
+  if (!callId || !recordingSid) return;
+
+  try {
+    if (recordingStatus === "completed") {
+      const { data: existing, error: findErr } = await supabase
+        .from("call_recordings")
+        .select("id")
+        .eq("recording_sid", recordingSid)
+        .limit(1);
+      if (findErr) {
+        console.error("[recording] Lookup failed:", findErr.message);
+        return;
+      }
+
+      if (existing?.length) {
+        const { error } = await supabase
+          .from("call_recordings")
+          .update({
+            recording_url: recordingUrl || "unavailable",
+            duration_seconds: durationSeconds,
+            status: "completed",
+            channels: 2,
+          })
+          .eq("recording_sid", recordingSid);
+        if (error) console.error("[recording] Update on complete failed:", error.message);
+      } else {
+        const { error } = await supabase.from("call_recordings").insert({
+          call_id: callId,
+          recording_sid: recordingSid,
+          recording_url: recordingUrl || "unavailable",
+          duration_seconds: durationSeconds,
+          status: "completed",
+          channels: 2,
+        });
+        if (error) console.error("[recording] Insert on complete failed:", error.message);
+      }
+      console.log(`[recording] Completed callId=${callId} sid=${recordingSid}`);
+      return;
+    }
+
+    if (recordingStatus === "failed" || recordingStatus === "absent") {
+      const { error } = await supabase
+        .from("call_recordings")
+        .update({
+          status: "failed",
+          recording_url: "unavailable",
+        })
+        .eq("recording_sid", recordingSid);
+      if (error) console.error("[recording] Mark failed error:", error.message);
+    }
+  } catch (err) {
+    console.error("[recording-status] Error:", err.message);
+  }
 });
 
 // -- Fetch customer's recent bills from DB (graceful — works even if table missing) --
@@ -640,66 +767,6 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Unexpected error." });
 });
 
-// -- Recording status callback (Twilio posts when recording is ready) -
-app.post("/api/recording-status", async (req, res) => {
-  res.status(200).end();
-
-  const callId       = String(req.query.call_id        || "").trim();
-  const recordingSid = String(req.body.RecordingSid    || "").trim();
-  const recordingUrl = String(req.body.RecordingUrl    || "").trim();
-  const status       = String(req.body.RecordingStatus || "completed").trim();
-  const duration     = parseInt(req.body.RecordingDuration, 10) || null;
-  const channels     = parseInt(req.body.RecordingChannels, 10) || 1;
-
-  console.log(`[recording] callId=${callId} sid=${recordingSid} status=${status} duration=${duration}s`);
-
-  if (!callId || !recordingUrl) {
-    console.warn("[recording] Missing call_id or RecordingUrl — skipping");
-    return;
-  }
-
-  const { error } = await supabase.from("call_recordings").insert({
-    call_id:          callId,
-    recording_sid:    recordingSid || null,
-    recording_url:    recordingUrl,
-    duration_seconds: duration,
-    status,
-    channels,
-  });
-
-  if (error) console.error("[recording] Insert error:", error.message);
-  else console.log("[recording] Recording saved ✓");
-});
-
-// -- Recording audio proxy (streams Twilio-hosted MP3 to the frontend) -
-app.get("/api/recordings/:sid", (req, res) => {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-    return res.status(503).send("Twilio not configured");
-  }
-
-  const { sid } = req.params;
-  if (!sid || !/^RE[0-9a-f]{32}$/i.test(sid)) {
-    return res.status(400).send("Invalid recording SID");
-  }
-
-  const https = require("https");
-  const auth  = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN.trim()}`).toString("base64");
-  const url   = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
-
-  const twilioReq = https.get(url, { headers: { Authorization: `Basic ${auth}` } }, (twilioRes) => {
-    if (twilioRes.statusCode === 401) { return res.status(401).send("Twilio auth failed"); }
-    if (twilioRes.statusCode === 404) { return res.status(404).send("Recording not found"); }
-    res.set("Content-Type", "audio/mpeg");
-    res.set("Cache-Control", "public, max-age=3600");
-    twilioRes.pipe(res);
-  });
-
-  twilioReq.on("error", (err) => {
-    console.error("[recording] Proxy error:", err.message);
-    if (!res.headersSent) res.status(500).send("Failed to fetch recording");
-  });
-});
-
 // -- Customer details -----------------------------------------
 async function fetchCustomerDetails(req, res, overrides = {}) {
   const id    = String(overrides.id    ?? req.query.id    ?? "").trim();
@@ -736,40 +803,6 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
 
-// ── Schema migration: create call_recordings table if absent ──
-async function ensureSchema() {
-  const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl) {
-    console.warn("[startup] DATABASE_URL not set — skipping auto-migration.");
-    console.warn("[startup] Add DATABASE_URL to .env (Supabase → Settings → Database → URI).");
-    return;
-  }
-
-  const client = new PgClient({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
-  try {
-    await client.connect();
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS call_recordings (
-        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-        call_id          UUID        REFERENCES calls(id) ON DELETE CASCADE,
-        recording_sid    TEXT,
-        recording_url    TEXT NOT NULL,
-        duration_seconds INTEGER,
-        status           TEXT DEFAULT 'completed',
-        channels         INTEGER DEFAULT 1,
-        created_at       TIMESTAMPTZ DEFAULT now()
-      );
-      CREATE INDEX IF NOT EXISTS call_recordings_call_id_idx ON call_recordings(call_id);
-    `);
-    console.log("[startup] call_recordings table ensured ✓");
-  } catch (err) {
-    console.error("[startup] Schema migration failed:", err.message);
-    console.error("[startup] Create the call_recordings table manually in Supabase SQL editor.");
-  } finally {
-    await client.end().catch(() => {});
-  }
-}
-
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
   server.listen(p, () =>
@@ -788,7 +821,7 @@ function startServer(p) {
 }
 
 if (require.main === module) {
-  ensureSchema().then(() => startServer(port));
+  startServer(port);
 }
 
 module.exports = { app, server };
