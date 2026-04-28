@@ -46,6 +46,11 @@ const {
   TWILIO_TWIML_APP_SID,
   TWILIO_PHONE_NUMBER,
   PORT,
+  AGENT_IDENTITY_BILLING,
+  AGENT_IDENTITY_SUPPORT,
+  AGENT_IDENTITY_GENERAL,
+  AGENT_IDENTITY_FALLBACK,
+  ENABLE_SKILL_ROUTING,
 } = process.env;
 
 const MISSING_VARS = [
@@ -91,6 +96,34 @@ function safeRecordingUrl(recordingUrl) {
   const raw = String(recordingUrl || "").trim();
   if (!raw) return "";
   return raw.endsWith(".mp3") || raw.endsWith(".wav") ? raw : `${raw}.mp3`;
+}
+
+function normalizeEnvBool(value, defaultValue = false) {
+  const v = String(value ?? "").trim().toLowerCase();
+  if (!v) return defaultValue;
+  return v === "true" || v === "1" || v === "yes" || v === "y";
+}
+
+function resolveAgentIdentity(customer, req) {
+  const fallback = String(AGENT_IDENTITY_FALLBACK || "agent").trim() || "agent";
+  const general  = String(AGENT_IDENTITY_GENERAL  || fallback).trim() || fallback;
+  const billing  = String(AGENT_IDENTITY_BILLING  || fallback).trim() || fallback;
+  const support  = String(AGENT_IDENTITY_SUPPORT  || fallback).trim() || fallback;
+  const skillRoutingEnabled = normalizeEnvBool(ENABLE_SKILL_ROUTING, false);
+
+  if (!skillRoutingEnabled) return fallback;
+
+  // For now, route by explicit hint if provided by upstream.
+  const routeHint = String(req?.query?.route || req?.body?.route || "").trim().toLowerCase();
+  if (routeHint === "billing") return billing;
+  if (routeHint === "support") return support;
+  if (routeHint === "general") return general;
+
+  // Fallback to general queue when skill routing is enabled but no hint exists.
+  if (customer?.tier && String(customer.tier).toLowerCase() === "platinum") {
+    return support;
+  }
+  return general;
 }
 
 async function hasActiveRecording(callId) {
@@ -160,7 +193,6 @@ function customerConferenceTwiml(callId) {
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Please hold while we connect you to an agent.</Say>
   <Start>
     <Transcription statusCallbackUrl="${transcriptionUrl}"
                    statusCallbackMethod="POST"
@@ -168,7 +200,7 @@ function customerConferenceTwiml(callId) {
   </Start>
   <Dial>
     <Conference beep="false"
-                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                waitUrl=""
                 statusCallbackEvent="start join leave end"
                 statusCallback="${statusUrl}">
       ${room}
@@ -199,6 +231,49 @@ function agentConferenceTwiml(callId) {
 // ── Routes ────────────────────────────────────────────────────
 
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
+
+// -- Runtime debug: Twilio/env readiness + route resolution ----
+app.get("/api/debug/voice-readiness", async (req, res) => {
+  const fallback = String(AGENT_IDENTITY_FALLBACK || "agent").trim() || "agent";
+  const general  = String(AGENT_IDENTITY_GENERAL  || fallback).trim() || fallback;
+  const billing  = String(AGENT_IDENTITY_BILLING  || fallback).trim() || fallback;
+  const support  = String(AGENT_IDENTITY_SUPPORT  || fallback).trim() || fallback;
+  const enableSkillRouting = normalizeEnvBool(ENABLE_SKILL_ROUTING, false);
+
+  const routeHint = String(req.query.route || "").trim().toLowerCase();
+  const mockTier  = String(req.query.tier || "").trim() || null;
+  const mockCustomer = mockTier ? { tier: mockTier } : null;
+  const resolvedIdentity = resolveAgentIdentity(mockCustomer, { query: { route: routeHint }, body: {} });
+
+  return res.json({
+    backend_base_url: BASE_URL || null,
+    twilio_ready: Boolean(
+      TWILIO_ACCOUNT_SID &&
+      TWILIO_AUTH_TOKEN &&
+      TWILIO_API_KEY &&
+      TWILIO_API_SECRET &&
+      TWILIO_TWIML_APP_SID &&
+      TWILIO_PHONE_NUMBER &&
+      twilioClient
+    ),
+    env_checks: {
+      APP_BASE_URL: Boolean(BASE_URL),
+      TWILIO_ACCOUNT_SID: Boolean(TWILIO_ACCOUNT_SID),
+      TWILIO_AUTH_TOKEN: Boolean(TWILIO_AUTH_TOKEN),
+      TWILIO_API_KEY: Boolean(TWILIO_API_KEY),
+      TWILIO_API_SECRET: Boolean(TWILIO_API_SECRET),
+      TWILIO_TWIML_APP_SID: Boolean(TWILIO_TWIML_APP_SID),
+      TWILIO_PHONE_NUMBER: Boolean(TWILIO_PHONE_NUMBER),
+    },
+    routing: {
+      ENABLE_SKILL_ROUTING: enableSkillRouting,
+      configured_identities: { fallback, general, billing, support },
+      route_hint: routeHint || null,
+      mock_tier: mockTier,
+      resolved_identity: resolvedIdentity,
+    },
+  });
+});
 
 // -- Twilio Access Token for agent browser softphone ----------
 app.get("/api/token", (_req, res) => {
@@ -241,7 +316,9 @@ app.post("/api/twilio/voice", async (req, res) => {
 
   try {
     const customer = callerPhone ? await lookupCustomerByPhone(callerPhone) : null;
+    const agentIdentity = resolveAgentIdentity(customer, req);
     console.log(`[voice] customer     : ${customer ? `${customer.name} / tier=${customer.tier}` : "not found in DB"}`);
+    console.log(`[voice] agent route  : ${agentIdentity}`);
 
     // Insert call record immediately (fire-and-forget)
     supabase.from("calls").insert({
@@ -258,10 +335,10 @@ app.post("/api/twilio/voice", async (req, res) => {
     // Dial agent browser (laptop dashboard)
     if (twilioClient && TWILIO_PHONE_NUMBER) {
       const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-      console.log(`[voice] Dialling agent → client:agent`);
+      console.log(`[voice] Dialling agent → client:${agentIdentity}`);
       console.log(`[voice] Agent TwiML URL : ${agentUrl}`);
       twilioClient.calls.create({
-        to:   "client:agent",
+        to:   `client:${agentIdentity}`,
         from: TWILIO_PHONE_NUMBER,
         url:  agentUrl,
       }).then((call) => {
@@ -353,7 +430,7 @@ app.post("/api/twilio/outbound", async (req, res) => {
   </Start>
   <Dial>
     <Conference beep="false"
-                waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+                waitUrl=""
                 statusCallbackEvent="start join leave end"
                 statusCallback="${statusUrl}">
       ${room}
